@@ -44,16 +44,16 @@
 #define LED_RED_0 0x00000001 // Engine
 #define LED_RED_1 0x00000002 // Top Gear
 
-#define LED_RED_12 0x00001000 // Reserved
-#define LED_RED_13 0x00002000 // Reserved
-#define LED_RED_14 0x00004000 // Reserved
-#define LED_RED_15 0x00008000 // Reserved
-#define LED_RED_16 0x00010000 // Reserved
-#define LED_RED_17 0x00020000 // Reserved
+#define LED_RED_12 0x00001000 // LEDR17: [0m, 400m)
+#define LED_RED_13 0x00002000 // LEDR16: [400m, 800m)
+#define LED_RED_14 0x00004000 // LEDR15: [800m, 1200m)
+#define LED_RED_15 0x00008000 // LEDR14: [1200m, 1600m)
+#define LED_RED_16 0x00010000 // LEDR13: [1600m, 2000m)
+#define LED_RED_17 0x00020000 // LEDR12: [2000m, 2400m]
 
 
-#define LED_GREEN_0 0x0001 // Cruise Control activated
-#define LED_GREEN_2 0x0002 // Cruise Control Button
+#define LED_GREEN_1 0x0002 // Cruise Control activated
+#define LED_GREEN_2 0x0004 // Cruise Control Button
 #define LED_GREEN_4 0x0010 // Brake Pedal
 #define LED_GREEN_6 0x0040 // Gas Pedal
 
@@ -219,6 +219,15 @@ void show_velocity_on_sevenseg(INT8S velocity){
  */
 void show_target_velocity(INT8U target_vel)
 {
+  int out;
+  INT8U out_high = int2seven(0);
+  INT8U out_low = int2seven(0);
+  if (cruise_control == on) {
+    out_high = int2seven(target_vel / 10);
+    out_low = int2seven(target_vel - (target_vel/10) * 10);
+  }
+  out = out_high << 7 | out_low;
+  IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_HEX_HIGH28_BASE,out);
 }
 
 /*
@@ -232,7 +241,21 @@ void show_target_velocity(INT8U target_vel)
  */
 void show_position(INT16U position)
 {
-
+  led_red &= ~(LED_RED_12 | LED_RED_13 | LED_RED_14 | LED_RED_15 | LED_RED_16 | LED_RED_17);
+  if (position < 400) {
+        led_red |= LED_RED_17;
+    } else if (position < 800) {
+        led_red |= LED_RED_16;
+    } else if (position < 1200) {
+        led_red |= LED_RED_15;
+    } else if (position < 1600) {
+        led_red |= LED_RED_14;
+    } else if (position < 2000) {
+        led_red |= LED_RED_13;
+    } else if (position < 2400) {
+        led_red |= LED_RED_12;
+    }
+  IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_REDLED18_BASE, led_red);
 }
 
 /*
@@ -262,10 +285,7 @@ void ButtonIOTask(void* pdata) {
     }
     if (buttons & CRUISE_CONTROL_FLAG) {
       led_green |= LED_GREEN_2;
-      // write a code that will signal that
-      // cruise control is being pushed,
-      // determine if cruise control will be actually
-      // turned on in the control task
+      cruise_control = on;
     } else {
       cruise_control = off;
       led_green &= ~LED_GREEN_2;
@@ -397,38 +417,65 @@ void SwitchIOTask(void* pdata) {
  * on sensors and generates responses.
  */
 
-// void ControlTask(void* pdata)
-// {
-//   INT8U err;
-//   INT8U throttle = 40; /* Value between 0 and 80, which is interpreted as between 0.0V and 8.0V */
-//   void* msg;
-//   INT16S* current_velocity;
+void ControlTask(void* pdata)
+{
+  INT8U err;
+  INT8U throttle = 0;
+  void* msg;
+  // INT16S* current_velocity;
 
-//   printf("Control Task created!\n");
+  INT8U target_velocity = 25; // 25 m/s
+  INT16U position = 0;
+  INT16S current_velocity = 0;
+  INT16S acceleration = 0;
 
-//   while(1)
-//   {
-//     // Wait for the soft timer
-//     OSSemPend(Sem_ControlTask, 0, &err);
+  printf("Control Task created!\n");
 
-//     msg = OSMboxPend(Mbox_Velocity, 0, &err);
-//     current_velocity = (INT16S*) msg;
+  while(1)
+  {
+    // Wait for the soft timer
+    OSSemPend(Sem_ControlTask, 0, &err);
 
-//     // Here you can use whatever technique or algorithm that you prefer to control
-//     // the velocity via the throttle. There are no right and wrong answer to this controller, so
-//     // be free to use anything that is able to maintain the cruise working properly. You are also
-//     // allowed to store more than one sample of the velocity. For instance, you could define
-//     //
-//     // INT16S previous_vel;
-//     // INT16S pre_previous_vel;
-//     // ...
-//     //
-//     // If your control algorithm/technique needs them in order to function. 
+    // msg = OSMboxPend(Mbox_Velocity, 0, &err);
+    // current_velocity = (INT16S*) msg;
+    const unsigned int dummy_resistance_factor = 1;
+    // Dummy code to test out show_position and show_target_velocity
+    if (engine == on) {
+      if (brake_pedal == on) {
+        throttle = 0;
+      } else if (gas_pedal == on) {
+        if (top_gear == on) {
+          throttle = 50;
+        } else {
+          throttle = 80;
+        }
+      } else if ((top_gear == on) && (cruise_control == on) && (current_velocity > 20)) {
+        INT16S velocity_error = target_velocity - current_velocity;
+        throttle = velocity_error + dummy_resistance_factor * current_velocity;
+      } else {
+        throttle = 0;
+      }
+    } else {
+      throttle = 0;
+    }
 
-//     err = OSMboxPost(Mbox_Throttle, (void *) &throttle);
+    acceleration = - (dummy_resistance_factor + (current_velocity < 10 ? 2 : 0)) * (current_velocity);
+    acceleration += throttle;
+    current_velocity = current_velocity + acceleration * CONTROL_PERIOD / 1000.0;
+    position = position + current_velocity * CONTROL_PERIOD / 1000.0;
 
-//   }
-// }
+    if (position > 2400) {
+      position = 0;
+    }
+
+    show_position(position);
+    show_target_velocity(target_velocity);
+    show_velocity_on_sevenseg((INT8S) current_velocity);
+
+    // err = OSMboxPost(Mbox_Throttle, (void *) &throttle);
+
+  }
+}
 
 /* 
  * The task 'StartTask' creates all other tasks kernel objects and
@@ -460,14 +507,14 @@ void StartTask(void* pdata)
   /* 
    * Create and start Software Timer 
    */
-  // ControlTask_Timer = OSTmrCreate(0,
-  //     CONTROL_PERIOD/100,
-  //     OS_TMR_OPT_PERIODIC,
-  //     control_timer_callback,
-  //     (void *)0,
-  //     "Control Timer",
-  //     &err);
-  // OSTmrStart(ControlTask_Timer, &err);
+  ControlTask_Timer = OSTmrCreate(0,
+      CONTROL_PERIOD/100,
+      OS_TMR_OPT_PERIODIC,
+      control_timer_callback,
+      (void *)0,
+      "Control Timer",
+      &err);
+  OSTmrStart(ControlTask_Timer, &err);
   // VehicleTask_Timer = OSTmrCreate(0,
   //     VEHICLE_PERIOD/100,
   //     OS_TMR_OPT_PERIODIC,
@@ -520,18 +567,18 @@ void StartTask(void* pdata)
    */
 
 
-  // err = OSTaskCreateExt(
-  //     ControlTask, // Pointer to task code
-  //     NULL,        // Pointer to argument that is
-  //     // passed to task
-  //     &ControlTask_Stack[TASK_STACKSIZE-1], // Pointer to top
-  //     // of task stack
-  //     CONTROLTASK_PRIO,
-  //     CONTROLTASK_PRIO,
-  //     (void *)&ControlTask_Stack[0],
-  //     TASK_STACKSIZE,
-  //     (void *) 0,
-  //     OS_TASK_OPT_STK_CHK);
+  err = OSTaskCreateExt(
+      ControlTask, // Pointer to task code
+      NULL,        // Pointer to argument that is
+      // passed to task
+      &ControlTask_Stack[TASK_STACKSIZE-1], // Pointer to top
+      // of task stack
+      CONTROLTASK_PRIO,
+      CONTROLTASK_PRIO,
+      (void *)&ControlTask_Stack[0],
+      TASK_STACKSIZE,
+      (void *) 0,
+      OS_TASK_OPT_STK_CHK);
 
   // err = OSTaskCreateExt(
   //     VehicleTask, // Pointer to task code
