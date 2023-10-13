@@ -90,6 +90,11 @@ OS_STK SwitchIO_Stack[TASK_STACKSIZE];
 // Mailboxes
 OS_EVENT *Mbox_Throttle;
 OS_EVENT *Mbox_Velocity;
+OS_EVENT *Mbox_Brake;
+OS_EVENT *Mbox_Engine;
+OS_EVENT *Mbox_TopGear;
+OS_EVENT *Mbox_Gas;
+OS_EVENT *Mbox_CruiseControl;
 
 // Semaphores
 OS_EVENT *Sem_VehicleTask;
@@ -115,11 +120,6 @@ enum active {on = 2, off = 1};
 int delay; // Delay of HW-timer 
 INT16U led_green = 0; // Green LEDs
 INT32U led_red = 0;   // Red LEDs
-enum active top_gear = off;
-enum active engine = off;
-enum active cruise_control = off;
-enum active brake_pedal = off;
-enum active gas_pedal = off;
 
 /*
  * Helper functions
@@ -218,12 +218,10 @@ void show_velocity_on_sevenseg(INT8S velocity){
 void show_target_velocity(INT8U target_vel)
 {
   int out;
-  INT8U out_high = int2seven(0);
-  INT8U out_low = int2seven(0);
-  if (cruise_control == on) {
-    out_high = int2seven(target_vel / 10);
-    out_low = int2seven(target_vel - (target_vel/10) * 10);
-  }
+  INT8U out_high;
+  INT8U out_low;
+  out_high = int2seven(target_vel / 10);
+  out_low = int2seven(target_vel - (target_vel/10) * 10);
   out = out_high << 7 | out_low;
   IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_HEX_HIGH28_BASE,out);
 }
@@ -259,6 +257,7 @@ void show_position(INT16U position)
 /*
  * The tasks ButtonIO and SwitchIO periodically check if
  * buttons or switches, respectively, are pressed
+ * They communicate through mailboxes
  */
 
 void ButtonIOTask(void* pdata) {
@@ -268,24 +267,24 @@ void ButtonIOTask(void* pdata) {
     OSSemPend(Sem_ButtonIO, 0, &err);
     buttons = buttons_pressed();
     if (buttons & GAS_PEDAL_FLAG) {
-      gas_pedal = on;
+      err = OSMboxPost(Mbox_Gas, (void *) 2);
       led_green |= LED_GREEN_6;
     } else {
-      gas_pedal = off;
+      err = OSMboxPost(Mbox_Gas, (void *) 1);
       led_green &= ~LED_GREEN_6;
     }
     if (buttons & BRAKE_PEDAL_FLAG) {
-      brake_pedal = on;
+      err = OSMboxPost(Mbox_Brake, (void *) 2);
       led_green |= LED_GREEN_4;
     } else {
-      brake_pedal = off;
+      err = OSMboxPost(Mbox_Brake, (void *) 1);
       led_green &= ~LED_GREEN_4;
     }
     if (buttons & CRUISE_CONTROL_FLAG) {
+      err = OSMboxPost(Mbox_CruiseControl, (void *) 2);
       led_green |= LED_GREEN_2;
-      cruise_control = on;
     } else {
-      cruise_control = off;
+      err = OSMboxPost(Mbox_CruiseControl, (void *) 1);
       led_green &= ~LED_GREEN_2;
     }
     IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_GREENLED9_BASE, led_green);
@@ -299,17 +298,17 @@ void SwitchIOTask(void* pdata) {
     OSSemPend(Sem_SwitchIO, 0, &err);
     switches = switches_pressed();
     if (switches & TOP_GEAR_FLAG) {
-      top_gear = on;
+      err = OSMboxPost(Mbox_TopGear, (void *) 2);
       led_red |= LED_RED_1;
     } else {
-      top_gear = off;
+      err = OSMboxPost(Mbox_TopGear, (void *) 1);
       led_red &= ~LED_RED_1;
     }
     if (switches & ENGINE_FLAG) {
-      engine = on;
+      err = OSMboxPost(Mbox_Engine, (void *) 2);
       led_red |= LED_RED_0;
     } else {
-      engine = off;
+      err = OSMboxPost(Mbox_Engine, (void *) 1);
       led_red &= ~LED_RED_0;
     }
 
@@ -326,81 +325,90 @@ void SwitchIOTask(void* pdata) {
  * You can prove that easily via basic LTI systems methods.
  */
 
-void VehicleTask(void* pdata)
-{ 
-  // constants that should not be modified
-  const unsigned int wind_factor = 1;
-  const unsigned int brake_factor = 4;
-  const unsigned int gravity_factor = 2;
-  // variables relevant to the model and its simulation on top of the RTOS
-  INT8U err;  
-  void* msg;
-  INT8U* throttle; 
-  INT16S acceleration;  
-  INT16U position = 0; 
-  INT16S velocity = 0; 
+// void VehicleTask(void* pdata)
+// { 
+//   // constants that should not be modified
+//   const unsigned int wind_factor = 1;
+//   const unsigned int brake_factor = 4;
+//   const unsigned int gravity_factor = 2;
+//   // variables relevant to the model and its simulation on top of the RTOS
+//   INT8U err;  
+//   void* msg;
+//   INT8U* throttle; 
+//   INT16S acceleration;  
+//   INT16U position = 0; 
+//   INT16S velocity = 0;
+//   enum active brake_pedal = off;
+//   enum active engine = off;
 
-  printf("Vehicle task created!\n");
+//   printf("Vehicle task created!\n");
 
-  while(1)
-  {
-    // Wait for the semaphore
-    OSSemPend(Sem_VehicleTask, 0, &err);
+//   while(1)
+//   {
+//     err = OSMboxPost(Mbox_Velocity, (void *) &velocity);
+    
+//     // Wait for the semaphore
+//     OSSemPend(Sem_VehicleTask, 0, &err);
 
-    err = OSMboxPost(Mbox_Velocity, (void *) &velocity);
+//     /* Non-blocking read of mailbox: 
+//        - message in mailbox: update throttle
+//        - no message:         use old throttle
+//        */
+//     msg = OSMboxPend(Mbox_Throttle, 1, &err); 
+//     if (err == OS_NO_ERR) 
+//       throttle = (INT8U*) msg;
+//     /* Same for the brake signal that bypass the control law */
+//     msg = OSMboxPend(Mbox_Brake, 1, &err); 
+//     if (err == OS_NO_ERR) 
+//       brake_pedal = (enum active) msg;
+//     /* Same for the engine signal that bypass the control law */
+//     msg = OSMboxPend(Mbox_Engine, 1, &err); 
+//     if (err == OS_NO_ERR) 
+//       engine = (enum active) msg;
 
+//     // vehichle cannot effort more than 80 units of throttle
+//     if (*throttle > 80) *throttle = 80;
 
-    /* Non-blocking read of mailbox: 
-       - message in mailbox: update throttle
-       - no message:         use old throttle
-       */
-    msg = OSMboxPend(Mbox_Throttle, 1, &err); 
-    if (err == OS_NO_ERR) 
-      throttle = (INT8U*) msg;
+//     // brakes + wind
+//     if (brake_pedal == off)
+//     {
+//       // wind resistance
+//       acceleration = - wind_factor*velocity;
+//       // actuate with engines
+//       if (engine == on)
+//         acceleration += (*throttle);
 
-    // vehichle cannot effort more than 80 units of throttle
-    if (*throttle > 80) *throttle = 80;
+//       // gravity effects
+//       if (400 <= position && position < 800)
+//         acceleration -= gravity_factor; // traveling uphill
+//       else if (800 <= position && position < 1200)
+//         acceleration -= 2*gravity_factor; // traveling steep uphill
+//       else if (1600 <= position && position < 2000)
+//         acceleration += 2*gravity_factor; //traveling downhill
+//       else if (2000 <= position)
+//         acceleration += gravity_factor; // traveling steep downhill
+//     }
+//     // if the engine and the brakes are activated at the same time,
+//     // we assume that the brake dynamics dominates, so both cases fall
+//     // here.
+//     else 
+//       acceleration = - brake_factor*velocity;
 
-    // brakes + wind
-    if (brake_pedal == off)
-    {
-      // wind resistance
-      acceleration = - wind_factor*velocity;
-      // actuate with engines
-      if (engine == on)
-        acceleration += (*throttle);
+//     printf("Position: %d m\n", position);
+//     printf("Velocity: %d m/s\n", velocity);
+//     printf("Accell: %d m/s2\n", acceleration);
+//     printf("Throttle: %d V\n", *throttle);
 
-      // gravity effects
-      if (400 <= position && position < 800)
-        acceleration -= gravity_factor; // traveling uphill
-      else if (800 <= position && position < 1200)
-        acceleration -= 2*gravity_factor; // traveling steep uphill
-      else if (1600 <= position && position < 2000)
-        acceleration += 2*gravity_factor; //traveling downhill
-      else if (2000 <= position)
-        acceleration += gravity_factor; // traveling steep downhill
-    }
-    // if the engine and the brakes are activated at the same time,
-    // we assume that the brake dynamics dominates, so both cases fall
-    // here.
-    else 
-      acceleration = - brake_factor*velocity;
+//     position = position + velocity * VEHICLE_PERIOD / 1000;
+//     velocity = velocity  + acceleration * VEHICLE_PERIOD / 1000.0;
+//     // reset the position to the beginning of the track
+//     if(position > 2400)
+//       position = 0;
 
-    printf("Position: %d m\n", position);
-    printf("Velocity: %d m/s\n", velocity);
-    printf("Accell: %d m/s2\n", acceleration);
-    printf("Throttle: %d V\n", *throttle);
-
-    position = position + velocity * VEHICLE_PERIOD / 1000;
-    velocity = velocity  + acceleration * VEHICLE_PERIOD / 1000.0;
-    // reset the position to the beginning of the track
-    if(position > 2400)
-      position = 0;
-
-    show_velocity_on_sevenseg((INT8S) velocity);
-    show_position(position);
-  }
-} 
+//     show_velocity_on_sevenseg((INT8S) velocity);
+//     show_position(position);
+//   }
+// } 
 
 /*
  * The task 'ControlTask' is the main task of the application. It reacts
@@ -410,11 +418,15 @@ void VehicleTask(void* pdata)
 void ControlTask(void* pdata)
 {
   INT8U err;
-  INT8U throttle = 40;
+  INT8U throttle = 0;
   void* msg;
   INT16S* current_velocity;
 
-  INT8U target_velocity = 25; // 25 m/s
+  enum active gas_pedal = off;
+  enum active top_gear = off;
+  enum active cruise_control = off;
+
+  const INT16S target_velocity = 25; // 25 m/s
 
   printf("Control Task created!\n");
 
@@ -425,7 +437,7 @@ void ControlTask(void* pdata)
 
     msg = OSMboxPend(Mbox_Velocity, 0, &err);
     current_velocity = (INT16S*) msg;
-
+    
 
     err = OSMboxPost(Mbox_Throttle, (void *) &throttle);
 
@@ -456,7 +468,7 @@ void StartTask(void* pdata)
         alarm_handler,
         context) < 0)
   {
-    printf("No system clock available!n");
+    printf("No system clock available!\n");
   }
 
   /* 
@@ -470,14 +482,14 @@ void StartTask(void* pdata)
       "Control Timer",
       &err);
   OSTmrStart(ControlTask_Timer, &err);
-  VehicleTask_Timer = OSTmrCreate(0,
-      VEHICLE_PERIOD/100,
-      OS_TMR_OPT_PERIODIC,
-      vehicle_timer_callback,
-      (void *)0,
-      "Vehicle Timer",
-      &err);
-  OSTmrStart(VehicleTask_Timer, &err);
+  // VehicleTask_Timer = OSTmrCreate(0,
+  //     VEHICLE_PERIOD/100,
+  //     OS_TMR_OPT_PERIODIC,
+  //     vehicle_timer_callback,
+  //     (void *)0,
+  //     "Vehicle Timer",
+  //     &err);
+  // OSTmrStart(VehicleTask_Timer, &err);
   ButtonIO_Timer = OSTmrCreate(0,
       IO_PERIOD/100,
       OS_TMR_OPT_PERIODIC,
@@ -502,9 +514,17 @@ void StartTask(void* pdata)
   // Mailboxes
   Mbox_Throttle = OSMboxCreate((void*) 0); /* Empty Mailbox - Throttle */
   Mbox_Velocity = OSMboxCreate((void*) 0); /* Empty Mailbox - Velocity */
+  Mbox_Brake = OSMboxCreate((void*) 1); /* Empty Mailbox - Brake */
+  Mbox_Engine = OSMboxCreate((void*) 1); /* Empty Mailbox - Engine */
+  Mbox_TopGear = OSMboxCreate((void*) 1); /* Empty Mailbox - Top Gear */
+  Mbox_Gas = OSMboxCreate((void*) 1); /* Empty Mailbox - Gas */
+  Mbox_CruiseControl = OSMboxCreate((void*) 1); /* Empty Mailbox - Cruise Control */
 
   // Semaphores
   Sem_VehicleTask = OSSemCreate(0); /* Binary Semaphore */
+  // at the start, control task will run immediately,
+  // while other tasks wait a bit, because it's semaphore
+  // is initialized to 1
   Sem_ControlTask = OSSemCreate(1); /* Binary Semaphore */
   Sem_ButtonIO = OSSemCreate(1); /* Binary Semaphore */
   Sem_SwitchIO = OSSemCreate(1); /* Binary Semaphore */
@@ -533,18 +553,18 @@ void StartTask(void* pdata)
       (void *) 0,
       OS_TASK_OPT_STK_CHK);
 
-  err = OSTaskCreateExt(
-      VehicleTask, // Pointer to task code
-      NULL,        // Pointer to argument that is
-      // passed to task
-      &VehicleTask_Stack[TASK_STACKSIZE-1], // Pointer to top
-      // of task stack
-      VEHICLETASK_PRIO,
-      VEHICLETASK_PRIO,
-      (void *)&VehicleTask_Stack[0],
-      TASK_STACKSIZE,
-      (void *) 0,
-      OS_TASK_OPT_STK_CHK);
+  // err = OSTaskCreateExt(
+  //     VehicleTask, // Pointer to task code
+  //     NULL,        // Pointer to argument that is
+  //     // passed to task
+  //     &VehicleTask_Stack[TASK_STACKSIZE-1], // Pointer to top
+  //     // of task stack
+  //     VEHICLETASK_PRIO,
+  //     VEHICLETASK_PRIO,
+  //     (void *)&VehicleTask_Stack[0],
+  //     TASK_STACKSIZE,
+  //     (void *) 0,
+  //     OS_TASK_OPT_STK_CHK);
   
   err = OSTaskCreateExt(
       ButtonIOTask, // Pointer to task code
