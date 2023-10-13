@@ -90,11 +90,6 @@ OS_STK SwitchIO_Stack[TASK_STACKSIZE];
 // Mailboxes
 OS_EVENT *Mbox_Throttle;
 OS_EVENT *Mbox_Velocity;
-OS_EVENT *Mbox_Brake;
-OS_EVENT *Mbox_Engine;
-OS_EVENT *Mbox_TopGear;
-OS_EVENT *Mbox_Gas;
-OS_EVENT *Mbox_CruiseControl;
 
 // Semaphores
 OS_EVENT *Sem_VehicleTask;
@@ -120,6 +115,12 @@ enum active {on = 2, off = 1};
 int delay; // Delay of HW-timer 
 INT16U led_green = 0; // Green LEDs
 INT32U led_red = 0;   // Red LEDs
+
+enum active gas_pedal = off;
+enum active brake_pedal = off;
+enum active top_gear = off;
+enum active engine = off;
+enum active cruise_control = off;
 
 /*
  * Helper functions
@@ -267,24 +268,24 @@ void ButtonIOTask(void* pdata) {
     OSSemPend(Sem_ButtonIO, 0, &err);
     buttons = buttons_pressed();
     if (buttons & GAS_PEDAL_FLAG) {
-      err = OSMboxPost(Mbox_Gas, (void *) 2);
+      gas_pedal = on;
       led_green |= LED_GREEN_6;
     } else {
-      err = OSMboxPost(Mbox_Gas, (void *) 1);
+      gas_pedal = off;
       led_green &= ~LED_GREEN_6;
     }
     if (buttons & BRAKE_PEDAL_FLAG) {
-      err = OSMboxPost(Mbox_Brake, (void *) 2);
+      brake_pedal = on;
       led_green |= LED_GREEN_4;
     } else {
-      err = OSMboxPost(Mbox_Brake, (void *) 1);
+      brake_pedal = off;
       led_green &= ~LED_GREEN_4;
     }
     if (buttons & CRUISE_CONTROL_FLAG) {
-      err = OSMboxPost(Mbox_CruiseControl, (void *) 2);
+      cruise_control = on;
       led_green |= LED_GREEN_2;
     } else {
-      err = OSMboxPost(Mbox_CruiseControl, (void *) 1);
+      cruise_control = off;
       led_green &= ~LED_GREEN_2;
     }
     IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_GREENLED9_BASE, led_green);
@@ -298,17 +299,17 @@ void SwitchIOTask(void* pdata) {
     OSSemPend(Sem_SwitchIO, 0, &err);
     switches = switches_pressed();
     if (switches & TOP_GEAR_FLAG) {
-      err = OSMboxPost(Mbox_TopGear, (void *) 2);
+      top_gear = on;
       led_red |= LED_RED_1;
     } else {
-      err = OSMboxPost(Mbox_TopGear, (void *) 1);
+      top_gear = off;
       led_red &= ~LED_RED_1;
     }
     if (switches & ENGINE_FLAG) {
-      err = OSMboxPost(Mbox_Engine, (void *) 2);
+      engine = on;
       led_red |= LED_RED_0;
     } else {
-      err = OSMboxPost(Mbox_Engine, (void *) 1);
+      engine = off;
       led_red &= ~LED_RED_0;
     }
 
@@ -338,8 +339,6 @@ void SwitchIOTask(void* pdata) {
 //   INT16S acceleration;  
 //   INT16U position = 0; 
 //   INT16S velocity = 0;
-//   enum active brake_pedal = off;
-//   enum active engine = off;
 
 //   printf("Vehicle task created!\n");
 
@@ -357,14 +356,6 @@ void SwitchIOTask(void* pdata) {
 //     msg = OSMboxPend(Mbox_Throttle, 1, &err); 
 //     if (err == OS_NO_ERR) 
 //       throttle = (INT8U*) msg;
-//     /* Same for the brake signal that bypass the control law */
-//     msg = OSMboxPend(Mbox_Brake, 1, &err); 
-//     if (err == OS_NO_ERR) 
-//       brake_pedal = (enum active) msg;
-//     /* Same for the engine signal that bypass the control law */
-//     msg = OSMboxPend(Mbox_Engine, 1, &err); 
-//     if (err == OS_NO_ERR) 
-//       engine = (enum active) msg;
 
 //     // vehichle cannot effort more than 80 units of throttle
 //     if (*throttle > 80) *throttle = 80;
@@ -422,10 +413,6 @@ void ControlTask(void* pdata)
   void* msg;
   INT16S* current_velocity;
 
-  enum active gas_pedal = off;
-  enum active top_gear = off;
-  enum active cruise_control = off;
-
   const INT16S target_velocity = 25; // 25 m/s
 
   printf("Control Task created!\n");
@@ -437,8 +424,10 @@ void ControlTask(void* pdata)
 
     msg = OSMboxPend(Mbox_Velocity, 0, &err);
     current_velocity = (INT16S*) msg;
-    
 
+    
+    show_target_velocity(target_velocity);
+    // Sending the throttle to vehicle task
     err = OSMboxPost(Mbox_Throttle, (void *) &throttle);
 
   }
@@ -514,12 +503,6 @@ void StartTask(void* pdata)
   // Mailboxes
   Mbox_Throttle = OSMboxCreate((void*) 0); /* Empty Mailbox - Throttle */
   Mbox_Velocity = OSMboxCreate((void*) 0); /* Empty Mailbox - Velocity */
-  Mbox_Brake = OSMboxCreate((void*) 1); /* Empty Mailbox - Brake */
-  Mbox_Engine = OSMboxCreate((void*) 1); /* Empty Mailbox - Engine */
-  Mbox_TopGear = OSMboxCreate((void*) 1); /* Empty Mailbox - Top Gear */
-  Mbox_Gas = OSMboxCreate((void*) 1); /* Empty Mailbox - Gas */
-  Mbox_CruiseControl = OSMboxCreate((void*) 1); /* Empty Mailbox - Cruise Control */
-
   // Semaphores
   Sem_VehicleTask = OSSemCreate(0); /* Binary Semaphore */
   // at the start, control task will run immediately,
