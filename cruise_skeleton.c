@@ -18,6 +18,18 @@
  *   quite readable. This modification is easily motivated and accepted by the course
  *   staff.
  */
+
+ /*
+ * Mailbox system for inputs is deprecated
+ * and the input signals are now declared as global variables
+ * and are updated by the IO tasks
+ *
+ * Vehicle and Control tasks still communicate via Mboxes
+ * (velocity - from vehicle to control, and throttle - from control to vehicle)
+ *
+ * Cruise control system (the control task) is implemented by:
+ * - Asman Hudaykulyyev and Ramazan Yestekbayev
+ */
 #include <stdio.h>
 #include "system.h"
 #include "includes.h"
@@ -44,6 +56,13 @@
 #define LED_RED_0 0x00000001 // Engine
 #define LED_RED_1 0x00000002 // Top Gear
 
+#define LED_RED_4 0x00000010 // Extra 2% load
+#define LED_RED_5 0x00000020 // Extra 2% load
+#define LED_RED_6 0x00000040 // Extra 2% load
+#define LED_RED_7 0x00000080 // Extra 2% load
+#define LED_RED_8 0x00000100 // Extra 2% load
+#define LED_RED_9 0x00000200 // Extra 2% load
+
 #define LED_RED_12 0x00001000 // LEDR17: [0m, 400m)
 #define LED_RED_13 0x00002000 // LEDR16: [400m, 800m)
 #define LED_RED_14 0x00004000 // LEDR15: [800m, 1200m)
@@ -69,7 +88,15 @@ OS_STK VehicleTask_Stack[TASK_STACKSIZE];
 OS_STK ButtonIO_Stack[TASK_STACKSIZE];
 OS_STK SwitchIO_Stack[TASK_STACKSIZE];
 
+OS_STK WatchdogTask_Stack[TASK_STACKSIZE]; 
+OS_STK OverloadDetectionTask_Stack[TASK_STACKSIZE]; 
+OS_STK ExtraLoadTask_Stack[TASK_STACKSIZE]; 
+
+
 // Task Priorities
+
+#define OVERLOADDETECT_PRIO  2
+#define EXTRA_LOAD_PRIO      4
 
 #define STARTTASK_PRIO     5
 #define VEHICLETASK_PRIO  10
@@ -77,11 +104,19 @@ OS_STK SwitchIO_Stack[TASK_STACKSIZE];
 #define BUTTONIOTASK_PRIO 14
 #define SWITCHIOTASK_PRIO 15
 
+#define WATCHDOG_PRIO     17
+
+
+
 // Task Periods
 
 #define CONTROL_PERIOD  300
 #define VEHICLE_PERIOD  300
 #define IO_PERIOD       100
+
+#define WATCHDOG_INTERVAL       300 // hyperperiod of all tasks, in ms
+#define OVERLOADDETECT_INTERVAL 300
+#define EXTRA_LOAD_INTERVAL     300 // extra load task interval
 
 /*
  * Definition of Kernel Objects 
@@ -91,17 +126,27 @@ OS_STK SwitchIO_Stack[TASK_STACKSIZE];
 OS_EVENT *Mbox_Throttle;
 OS_EVENT *Mbox_Velocity;
 
+OS_EVENT *Mbox_OKSignal;
+
 // Semaphores
 OS_EVENT *Sem_VehicleTask;
 OS_EVENT *Sem_ControlTask;
 OS_EVENT *Sem_ButtonIO;
 OS_EVENT *Sem_SwitchIO;
 
+OS_EVENT *Sem_Watchdog;
+OS_EVENT *Sem_OverloadDetection;
+OS_EVENT *Sem_ExtraLoad;
+
 // SW-Timer
 OS_TMR *ControlTask_Timer;
 OS_TMR *VehicleTask_Timer;
 OS_TMR *ButtonIO_Timer;
 OS_TMR *SwitchIO_Timer;
+
+OS_TMR *Watchdog_Timer;
+OS_TMR *OverloadDetection_Timer;
+OS_TMR *ExtraLoad_Timer;
 
 /*
  * Types
@@ -115,6 +160,7 @@ enum active {on = 2, off = 1};
 int delay; // Delay of HW-timer 
 INT16U led_green = 0; // Green LEDs
 INT32U led_red = 0;   // Red LEDs
+INT8U extra_load = 0; // Extra load for extra load task
 
 enum active gas_pedal = off;
 enum active brake_pedal = off;
@@ -146,22 +192,10 @@ void cruise_control_inactive() {
   IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_GREENLED9_BASE, led_green);
 }
 
-// Callback functions for the software timers
+// Callback function for the software timers
 
-void vehicle_timer_callback(void *ptmr, void *callback_arg) {
-  OSSemPost(Sem_VehicleTask);
-}
-
-void control_timer_callback(void *ptmr, void *callback_arg) {
-  OSSemPost(Sem_ControlTask);
-}
-
-void buttonio_timer_callback(void *ptmr, void *callback_arg) {
-  OSSemPost(Sem_ButtonIO);
-}
-
-void switchio_timer_callback(void *ptmr, void *callback_arg) {
-  OSSemPost(Sem_SwitchIO);
+void soft_timer_callback(void *ptmr, void *callback_arg) {
+  OSSemPost((OS_EVENT *) callback_arg);
 }
 
 
@@ -323,6 +357,21 @@ void SwitchIOTask(void* pdata) {
       led_red &= ~LED_RED_0;
     }
 
+    // Extra load calculated + turn on/off LEDs
+    int extractedPattern = (switches >> 4) & 0x3F; // Extract bit pattern from switch 4 to switch 9
+    extra_load = extractedPattern * 2; // 2% steps
+    if (extra_load > 100) extra_load = 100;
+
+    int led_red_arr[6] = {LED_RED_4, LED_RED_5, LED_RED_6, LED_RED_7, LED_RED_8, LED_RED_9};
+    int i;
+    for (i = 0; i < 6; ++i) {
+        if (extractedPattern & (1 << i)) {
+            led_red |= led_red_arr[i];
+        } else {
+            led_red &= ~led_red_arr[i];
+        }
+    }
+
     IOWR_ALTERA_AVALON_PIO_DATA(DE2_PIO_REDLED18_BASE, led_red);
   }
 }
@@ -456,13 +505,10 @@ void ControlTask(void* pdata)
     } else if (top_gear == on && cruise_control == on && *current_velocity >= 20) {
       cruise_control_active();
       show_target_velocity(target_velocity);
+      // PI controller for cruise control, Kp and Ki were acquired experimentally
       error = target_velocity - *current_velocity;
       accumulated_error += error;
-
       throttle = Kp * error + Ki * accumulated_error;
-
-      if (throttle > 80) throttle = 80;
-      if (throttle < 0) throttle = 0;
     } else {
       throttle = 0;
     }
@@ -470,6 +516,41 @@ void ControlTask(void* pdata)
     // Sending the throttle to vehicle task
     err = OSMboxPost(Mbox_Throttle, (void *) &throttle);
 
+  }
+}
+
+void WatchdogTask(void* pdata) {
+  INT8U err;
+  INT8U watchdog_err;
+  while (1) {
+    OSSemPend(Sem_Watchdog, 0, &err);
+
+    OSMboxPend(Mbox_OKSignal, WATCHDOG_INTERVAL/100, &watchdog_err);
+    if (watchdog_err == OS_TIMEOUT) {
+      printf("Watchdog timeout! By WatchdogTask\n");
+    }
+  }
+}
+
+void OverloadDetectionTask(void* pdata) {
+  INT8U err;
+  INT8U overload_err;
+  while (1) {
+    OSSemPend(Sem_OverloadDetection, 0, &err);
+
+    overload_err = OSMboxPost(Mbox_OKSignal, (void *) 1);
+  }
+}
+
+void ExtraLoadTask(void* pdata) {
+  INT8U err;
+  INT8U x;
+  unsigned int time_delay;
+  while (1) {
+    OSSemPend(Sem_ExtraLoad, 0, &err);
+    x = 0;
+    printf("Size of unsigned int: %zu bytes\n", sizeof(unsigned int));
+    // finish the code
   }
 }
 
@@ -500,42 +581,6 @@ void StartTask(void* pdata)
     printf("No system clock available!\n");
   }
 
-  /* 
-   * Create and start Software Timer 
-   */
-  ControlTask_Timer = OSTmrCreate(0,
-      CONTROL_PERIOD/100,
-      OS_TMR_OPT_PERIODIC,
-      control_timer_callback,
-      (void *)0,
-      "Control Timer",
-      &err);
-  OSTmrStart(ControlTask_Timer, &err);
-  VehicleTask_Timer = OSTmrCreate(0,
-      VEHICLE_PERIOD/100,
-      OS_TMR_OPT_PERIODIC,
-      vehicle_timer_callback,
-      (void *)0,
-      "Vehicle Timer",
-      &err);
-  OSTmrStart(VehicleTask_Timer, &err);
-  ButtonIO_Timer = OSTmrCreate(0,
-      IO_PERIOD/100,
-      OS_TMR_OPT_PERIODIC,
-      buttonio_timer_callback,
-      (void *)0,
-      "ButtonIO Timer",
-      &err);
-  OSTmrStart(ButtonIO_Timer, &err);
-  SwitchIO_Timer = OSTmrCreate(0,
-      IO_PERIOD/100,
-      OS_TMR_OPT_PERIODIC,
-      switchio_timer_callback,
-      (void *)0,
-      "SwitchIO Timer",
-      &err);
-  OSTmrStart(SwitchIO_Timer, &err);
-
   /*
    * Creation of Kernel Objects
    */
@@ -543,14 +588,78 @@ void StartTask(void* pdata)
   // Mailboxes
   Mbox_Throttle = OSMboxCreate((void*) 0); /* Empty Mailbox - Throttle */
   Mbox_Velocity = OSMboxCreate((void*) 0); /* Empty Mailbox - Velocity */
+  Mbox_OKSignal = OSMboxCreate((void*) 0); /* Empty Mailbox - OK Signal */
+
   // Semaphores
   Sem_VehicleTask = OSSemCreate(0); /* Binary Semaphore */
-  // at the start, control task will run immediately,
-  // while other tasks wait a bit, because it's semaphore
-  // is initialized to 1
   Sem_ControlTask = OSSemCreate(1); /* Binary Semaphore */
-  Sem_ButtonIO = OSSemCreate(1); /* Binary Semaphore */
-  Sem_SwitchIO = OSSemCreate(1); /* Binary Semaphore */
+  Sem_ButtonIO = OSSemCreate(0); /* Binary Semaphore */
+  Sem_SwitchIO = OSSemCreate(0); /* Binary Semaphore */
+  
+  Sem_Watchdog = OSSemCreate(0); /* Binary Semaphore */
+  Sem_OverloadDetection = OSSemCreate(0); /* Binary Semaphore */
+  Sem_ExtraLoad = OSSemCreate(0); /* Binary Semaphore */
+
+  /* 
+   * Create and start Software Timer 
+   */
+  ControlTask_Timer = OSTmrCreate(0,
+      CONTROL_PERIOD/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_ControlTask,
+      "Control Timer",
+      &err);
+  OSTmrStart(ControlTask_Timer, &err);
+  VehicleTask_Timer = OSTmrCreate(0,
+      VEHICLE_PERIOD/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_VehicleTask,
+      "Vehicle Timer",
+      &err);
+  OSTmrStart(VehicleTask_Timer, &err);
+  ButtonIO_Timer = OSTmrCreate(0,
+      IO_PERIOD/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_ButtonIO,
+      "ButtonIO Timer",
+      &err);
+  OSTmrStart(ButtonIO_Timer, &err);
+  SwitchIO_Timer = OSTmrCreate(0,
+      IO_PERIOD/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_SwitchIO,
+      "SwitchIO Timer",
+      &err);
+  OSTmrStart(SwitchIO_Timer, &err);
+
+  Watchdog_Timer = OSTmrCreate(0,
+      WATCHDOG_INTERVAL/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_Watchdog,
+      "Watchdog Timer",
+      &err);
+  OSTmrStart(Watchdog_Timer, &err);
+  OverloadDetection_Timer = OSTmrCreate(0,
+      OVERLOADDETECT_INTERVAL/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_OverloadDetection,
+      "Overload Detection Timer",
+      &err);
+  OSTmrStart(OverloadDetection_Timer, &err);
+  ExtraLoad_Timer = OSTmrCreate(0,
+      EXTRA_LOAD_INTERVAL/100,
+      OS_TMR_OPT_PERIODIC,
+      soft_timer_callback,
+      Sem_ExtraLoad,
+      "Extra Load Timer",
+      &err);
+  OSTmrStart(ExtraLoad_Timer, &err);
 
   /*
    * Create statistics task
@@ -614,6 +723,40 @@ void StartTask(void* pdata)
       TASK_STACKSIZE,
       (void *) 0,
       OS_TASK_OPT_STK_CHK);
+    
+  err = OSTaskCreateExt(
+    WatchdogTask,
+    NULL,
+    &WatchdogTask_Stack[TASK_STACKSIZE-1],
+    WATCHDOG_PRIO,
+    WATCHDOG_PRIO,
+    (void *)&WatchdogTask_Stack[0],
+    TASK_STACKSIZE,
+    (void *) 0,
+    OS_TASK_OPT_STK_CHK);
+  
+  err = OSTaskCreateExt(
+    OverloadDetectionTask,
+    NULL,
+    &OverloadDetectionTask_Stack[TASK_STACKSIZE-1],
+    OVERLOADDETECT_PRIO,
+    OVERLOADDETECT_PRIO,
+    (void *)&OverloadDetectionTask_Stack[0],
+    TASK_STACKSIZE,
+    (void *) 0,
+    OS_TASK_OPT_STK_CHK);
+
+err = OSTaskCreateExt(
+    ExtraLoadTask,
+    NULL,
+    &ExtraLoadTask_Stack[TASK_STACKSIZE-1],
+    EXTRA_LOAD_PRIO,
+    EXTRA_LOAD_PRIO,
+    (void *)&ExtraLoadTask_Stack[0],
+    TASK_STACKSIZE,
+    (void *) 0,
+    OS_TASK_OPT_STK_CHK);
+
 
   printf("All Tasks and Kernel Objects generated!\n");
 
